@@ -1,130 +1,110 @@
 extern crate spider;
-extern crate roxmltree; // สำหรับ parse XML sitemap
+extern crate html2md;
 
-use std::time::Instant;
-use std::fs::{write, OpenOptions};
-use std::io::Write;
-use std::path::Path;
-
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
+use tokio::io::AsyncWriteExt;
 use spider::website::Website;
-use spider::features::chrome_common::RequestInterceptConfiguration;
-use reqwest; // ใช้สำหรับ HTTP requests
-use html2md::parse_html; // ใช้สำหรับแปลง HTML เป็น Markdown
+use spider::tokio;
 
-// ฟังก์ชันสำหรับดึง Sitemap จากไฟล์ sitemap.xml
-async fn fetch_sitemap(url: &str) -> Result<Vec<String>, reqwest::Error> {
-    let response = reqwest::get(format!("{}/sitemap.xml", url)).await?;
-    let body = response.text().await?;
+use reqwest;
 
-    let mut urls = Vec::new();
-    if body.contains("<url>") {
-        let doc = roxmltree::Document::parse(&body).unwrap();
-        for node in doc.descendants().filter(|n| n.has_tag_name("loc")) {
-            if let Some(link) = node.text() {
-                urls.push(link.to_string());
-            }
-        }
-    }
-    Ok(urls)
+// นับจำนวน URL ที่ประมวลผลทั้งหมด
+static GLOBAL_URL_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+// เพิ่ม Copy และ Clone ให้กับ Enum Mode เพื่อให้สามารถคัดลอกค่าได้
+#[derive(Copy, Clone)]
+enum Mode {
+    HttpRequest, // ใช้ HTTP Request ปกติ (สำหรับ SSR)
+    Chrome,      // ใช้ Chrome Fetcher (สำหรับ SPA)
 }
 
-// ฟังก์ชันสำหรับตรวจสอบว่าเว็บไซต์เป็น SPA หรือ SSR
-async fn check_if_spa(url: &str) -> bool {
-    if let Ok(resp) = reqwest::get(url).await {
-        if let Ok(body) = resp.text().await {
-            if body.contains("window.__INITIAL_STATE__")
-                || body.contains("ReactDOM.render")
-                || body.contains("vuejs")
-                || body.contains("angular")
-                || body.contains("next-data")
-                || body.contains("<script src=")
-            {
-                return true;
-            }
-        }
-    }
-    false
+// ฟังก์ชันตรวจสอบว่าเป็น SPA หรือไม่
+fn is_spa(html_content: &str) -> bool {
+    html_content.contains("fetch(") || html_content.contains("XMLHttpRequest") || html_content.contains("window.__INITIAL_STATE__")
 }
 
-// ฟังก์ชันสำหรับแปลง HTML เป็น Markdown
-fn convert_html_to_markdown(html_content: &str) -> String {
-    parse_html(html_content)
+// ฟังก์ชันแปลง HTML เป็น Markdown
+fn html_to_markdown(html: &str) -> String {
+    html2md::parse_html(html)
 }
 
-// ฟังก์ชันสำหรับบันทึก Markdown ลงไฟล์แยก
-fn save_markdown_to_file(url: &str, markdown_content: &str) {
-    let file_name = url.replace("https://", "").replace("/", "_") + ".md";
-    let path = Path::new("output").join(file_name);
-
-    if let Err(e) = write(&path, markdown_content) {
-        eprintln!(" Error writing file {}: {}", path.display(), e);
-    } else {
-        println!(" Saved: {}", path.display());
+// ดึงข้อมูลด้วย HTTP Request (สำหรับ SSR)
+async fn fetch_with_http(url: &str) -> String {
+    match reqwest::get(url).await {
+        Ok(resp) => match resp.text().await {
+            Ok(text) => text,
+            Err(_) => String::new(),
+        },
+        Err(_) => String::new(),
     }
 }
 
-// ฟังก์ชันสำหรับบันทึก Markdown รวมทุก URL ลงไฟล์เดียว
-fn append_markdown_to_file(url: &str, markdown_content: &str) {
-    let path = Path::new("output/all_pages.md");
-
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .expect("Unable to open file");
-
-    if let Err(e) = writeln!(file, "\n## {}\n\n{}", url, markdown_content) {
-        eprintln!("Error writing to file: {}", e);
-    } else {
-        println!(" Appended content to: {}", path.display());
-    }
+// ดึงข้อมูลด้วย Chrome (จำลองการใช้งานผ่าน HTTP) (สำหรับ SPA)
+async fn fetch_with_chrome(url: &str) -> String {
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    fetch_with_http(url).await
 }
 
 #[tokio::main]
 async fn main() {
-    let base_url = "https://heygoody.com";
+    // กำหนดโหมดเริ่มต้น (สามารถปรับเปลี่ยนได้ตามความต้องการ)
+    let default_mode = Mode::HttpRequest; // เปลี่ยนเป็น Mode::Chrome หากต้องการใช้ Chrome mode เป็นค่าเริ่มต้น
 
-    // ตรวจสอบว่าเว็บไซต์เป็น SPA หรือ SSR
-    let is_spa = check_if_spa(base_url).await;
-    println!("เว็บไซต์นี้เป็น: {}", if is_spa { "SPA" } else { "SSR" });
+    // สร้าง Website instance โดยระบุ URL เป้าหมาย (ระบบจะดึง Sitemap จากเว็บไซต์นี้)
+    let mut website: Website = Website::new("https://heygoody.com/")
+        .with_caching(true)
+        .build()
+        .unwrap();
 
-    // กำหนดการใช้งาน Chrome Intercept ถ้าเป็น SPA
-    let mut website = if is_spa {
-        let intercept_config = RequestInterceptConfiguration::new(true);
-        Website::new(base_url)
-            .with_caching(true)
-            .with_chrome_intercept(intercept_config)
-            .build()
-            .unwrap()
-    } else {
-        Website::new(base_url)
-            .with_caching(true)
-            .build()
-            .unwrap()
-    };
+    // Subscribe เพื่อรับ event จากการ crawl (เช่น ลิงก์ที่พบจาก Sitemap)
+    let mut rx = website.subscribe(500).unwrap();
 
-    // ดึง URLs จาก Sitemap
-    let sitemap_urls = fetch_sitemap(base_url).await.unwrap_or_else(|_| vec![]);
-    println!("Found URLs from Sitemap: {:?}", sitemap_urls);
+    // สร้าง task สำหรับประมวลผลแต่ละ URL ที่ได้รับจาก event
+    tokio::spawn(async move {
+        while let Ok(res) = rx.recv().await {
+            let url = res.get_url().to_string();
+            println!("Crawled URL: {:?}", url);
 
-    //ทำการแปลง HTML ของแต่ละ URL เป็น Markdown และบันทึก
-    for url in &sitemap_urls {
-        if let Ok(resp) = reqwest::get(url).await {
-            if let Ok(body) = resp.text().await {
-                let markdown_content = convert_html_to_markdown(&body);
+            // ดึง HTML โดยใช้ HTTP Request ก่อน
+            let html_content = fetch_with_http(&url).await;
 
-                // บันทึก Markdown เป็นไฟล์แยก
-                save_markdown_to_file(url, &markdown_content);
+            // ตรวจสอบว่าเป็น SPA หรือ SSR โดยดูจากเนื้อหา HTML ที่ได้มา
+            let final_mode = if is_spa(&html_content) {
+                Mode::Chrome // ถ้าเป็น SPA ให้ใช้โหมด Chrome
+            } else {
+                Mode::HttpRequest // ถ้าเป็น SSR ให้ใช้โหมด HTTP Request
+            };
 
-                // บันทึก Markdown รวมทุกหน้าในไฟล์เดียว
-                append_markdown_to_file(url, &markdown_content);
-            }
+            // ดึง HTML ตามโหมดที่เลือก
+            let html = match final_mode {
+                Mode::HttpRequest => {
+                    println!("Fetching with HTTP Request for {:?}", url);
+                    html_content
+                }
+                Mode::Chrome => {
+                    println!("Fetching with Chrome mode for {:?}", url);
+                    fetch_with_chrome(&url).await
+                }
+            };
+
+            // แปลง HTML ที่ดึงมาเป็น Markdown
+            let markdown = html_to_markdown(&html);
+
+            // แสดงผล Markdown ใน console
+            println!("Markdown for {:?}:\n{}\n", url, markdown);
+
+            // นับจำนวน URL ที่ประมวลผล
+            GLOBAL_URL_COUNT.fetch_add(1, Ordering::Relaxed);
         }
-    }
+    });
 
-    // ทำการ Crawl เว็บไซต์ 
-    let start = Instant::now();
+    // เริ่มกระบวนการ crawl ซึ่งจะดึงข้อมูล Sitemap และรวบรวมลิงก์ทั้งหมด
     website.crawl().await;
-    let duration = start.elapsed();
-    println!("Time elapsed in crawl: {:?}", duration);
+    website.unsubscribe();
+
+    println!(
+        "Total pages processed: {:?}",
+        GLOBAL_URL_COUNT.load(Ordering::Relaxed)
+    );
 }
